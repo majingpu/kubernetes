@@ -1,0 +1,97 @@
+api文档： [https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.19/](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.19/) 
+```shell
+# 通过 kubectl 命令行工具来获取这些字段信息
+$kubectl explain deployment.metadata
+# 创建修改应用信息
+$kubectl create -f demo-nginx.yaml
+$kubectl apply -f demo-nginx.yaml (创建/修改)
+# 彻底删除资源
+$kubectl delete -f demo-nginx.yaml
+# 强制删除pod
+$kubectl delete pods/demo-nginx --force --grace-period=0
+# 查看创建过程
+$kubectl get nodes/demo-nginx-HWT23FS -w
+# 查看pod详细信息
+$kubectl describe pods/demo-nginx-HWT23FS
+# 查看pod所属哪台机器
+$kubectl get pods -o wide
+# 水平扩缩容
+$kubectl scale deployment nginx-deploy --replicas=4
+# 查看滚动更新状态
+$kubectl rollout status deployment/nginx-deploy
+# 暂定滚定更新
+$kubectl rollout pause deployment/nginx-deploy
+# 恢复暂定的资源
+$kubectl rollout resume deployment/nginx-deploy
+# 查看rs对象
+$kubectl get rs -l app=nginx
+NAME                      DESIRED   CURRENT   READY   AGE
+nginx-deploy-5b7b9ccb95   3         3         3       18m
+nginx-deploy-85ff79dd56   0         0         0       81m
+
+# 查看回滚历史版本
+$kubectl rollout history deployment nginx-deploy
+deployment.apps/nginx-deploy
+REVISION  CHANGE-CAUSE
+1         <none>
+2         <none>
+$kubectl rollout history deployment nginx-deploy --revision=1 (查看特定的版本)
+# 回滚到前一个版本
+$kubectl rollout undo deployment nginx-deploy --to-revision=1
+
+# 创建configmap
+$kubectl create configmap cm-demo1 --from-file=testcm (testcm为文件夹名称)
+$kubectl create configmap my-config --from-file=mysql=/root/pods/configmap/mysql.conf
+# 修改配置文件
+$kubectl edit cm cm-mysql -o yaml
+# 以json方式查看api信息
+$kubectl get --raw /apis/batch/v1 | python -m json.tool
+```
+
+pod配置
+```shell
+##静态pod
+$cd /etc/kubernetes/manifests (将yaml配置文件存放在该目录下)
+$kubectl apply -f static-web.yaml
+```
+:::info
+概念：什么是有状态服务，什么是无状态服务？
+
+- **无状态服务：**该服务运行的实例不会在本地存储需要持久化的数据，并且多个实例对于同一个请求响应的结果是完全一致的，比如前面我们讲解的 WordPress 实例，我们是不是可以同时启动多个实例，但是我们访问任意一个实例得到的结果都是一样的吧？因为他唯一需要持久化的数据是存储在MySQL数据库中的，所以我们可以说 WordPress 这个应用是无状态服务，但是 MySQL 数据库就不是了，因为他需要把数据持久化到本地。
+- **有状态服务：**就和上面的概念是对立的了，该服务运行的实例需要在本地存储持久化数据，比如上面的 MySQL 数据库，你现在运行在节点 A，那么他的数据就存储在节点 A 上面的，如果这个时候你把该服务迁移到节点 B 去的话，那么就没有之前的数据了，因为他需要去对应的数据目录里面恢复数据，而此时没有任何数据。
+
+:::
+
+```shell
+# 创建私钥（cnych.key）
+$openssl genrsa -out cnych.key 2048
+# 创建证书签名文件（cnych.csr）
+$openssl req -new -key cnych.key -out cnych.csr -subj "/CN=cnych/O=youdianzhishi"
+-subj参数中指定用户名和组(CN表示用户名，O表示组)：
+# 生成证书文件（cnych.crt）
+$ cd /etc/kubernetes/pki
+$ openssl x509 -req -in cnych.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out cnych.crt -days 500
+利用该目录下面的 ca.crt 和 ca.key两个文件来批准上面的证书请求。
+生成最终的证书文件，我们这里设置证书的有效期为 500 天
+
+# 在集群中创建新的凭证和上下文(Context)
+[root@k8s-master-001 pki]# kubectl config set-credentials cnych --client-certificate=cnych.crt --client-key=cnych.key
+User "cnych" set.
+[root@k8s-master-001 pki]# kubectl config set-context cnych-context --cluster=kubernetes --namespace=kube-system --user=cnych
+Context "cnych-context" created.
+# 创建角色，给该用户添加操作权限
+$vim cnych-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cnych-role
+  namespace: kube-system
+rules:
+- apiGroups: ["", "apps"]
+  resources: ["deployments", "replicasets", "pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] # 也可以使用['*']
+$ kubectl create -f cnych-role.yaml
+role.rbac.authorization.k8s.io/cnych-role created
+# 创建角色权限绑定
+
+```
