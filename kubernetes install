@@ -1,0 +1,398 @@
+# 安装前提
+```shell
+## 修改HOSTS文件
+$ vim /etc/hosts
+172.16.5.3 k8s-master-001
+172.16.5.4 k8s-node-002
+172.16.5.2 k8s-node-001
+
+## 禁用防火墙
+$ systemctl stop firewalld
+$ systemctl disable firewalld
+
+## 禁用SELINUX
+$ setenforce 0
+$ cat /etc/selinux/config
+SELINUX=disabled
+
+## 由于开启内核 ipv4 转发需要加载br_netfilter模块
+$ modprobe br_netfilter
+
+## 创建/etc/sysctl.d/k8s.conf文件，添加如下内容
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+vm.swappiness=0
+$ sysctl -p /etc/sysctl.d/k8s.conf
+
+## 安装ipvs
+$ cat > /etc/sysconfig/modules/ipvs.modules <<EOF
+#!/bin/bash
+modprobe -- ip_vs
+modprobe -- ip_vs_rr
+modprobe -- ip_vs_wrr
+modprobe -- ip_vs_sh
+modprobe -- nf_conntrack_ipv4
+EOF
+$ chmod 755 /etc/sysconfig/modules/ipvs.modules && bash /etc/sysconfig/modules/ipvs.modules && lsmod | grep -e ip_vs -e nf_conntrack_ipv4
+
+## 安装ipset、ipvsadm软件包
+$ yum install -y ipset ipvsadm
+
+## 同步服务器时间
+$ yum install chrony -y
+$ systemctl enable chronyd
+$ systemctl start chronyd
+$ chronyc sources
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample
+===============================================================================
+^+ sv1.ggsrv.de                  2   6    17    32   -823us[-1128us] +/-   98ms
+^- montreal.ca.logiplex.net      2   6    17    32    -17ms[  -17ms] +/-  179ms
+^- ntp6.flashdance.cx            2   6    17    32    -32ms[  -32ms] +/-  161ms
+^* 119.28.183.184                2   6    33    32   +661us[ +357us] +/-   38ms
+$ date
+Tue Aug 27 09:28:41 CST 2019
+
+## 关闭 swap 分区
+$ swapoff -a
+修改/etc/fstab文件，注释掉 SWAP 的自动挂载，使用free -m确认 swap 已经关闭。swappiness 参数调整，修改/etc/sysctl.d/k8s.conf添加下面一行：
+vm.swappiness=0
+执行sysctl -p /etc/sysctl.d/k8s.conf使修改生效
+```
+# Docker安装
+```shell
+# step 1: 安装必要的一些系统工具
+sudo yum install -y yum-utils device-mapper-persistent-data lvm2
+# Step 2: 添加软件源信息
+sudo yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+# Step 3
+sudo sed -i 's+download.docker.com+mirrors.aliyun.com/docker-ce+' /etc/yum.repos.d/docker-ce.repo
+# Step 4: 更新并安装Docker-CE
+sudo yum makecache
+sudo yum install -y --setopt=obsolutes=0 docker-ce-20.10.9-3.el7
+# Step 4: 开启Docker服务
+sudo service docker start
+
+## 配置 Docker 镜像加速器:
+$ mkdir -p /etc/docker  # 如果没有这个目录先创建，然后添加 daemon.json 文件
+$ vi /etc/docker/daemon.json
+{
+    "registry-mirrors": ["https://3xqoruat.mirror.aliyuncs.com"],
+    "bip": "192.168.1.1/24",
+    "dns": ["100.100.2.136","100.100.2.138"],
+    "graph": "/data/docker"
+}
+
+docker-compose 安装
+curl -L https://get.daocloud.io/docker/compose/releases/download/v2.4.1/docker-compose-`uname -s`-`uname -m` > /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
+
+
+注意事项：
+默认docker不允许非HTTPS方式推送镜像，到那时我们可以通过添加参数忽略HTTPS
+$ vim /etc/docker/daemon.json
+{
+  "insecure-registries": [
+    "192.168.199.100:5000" //内网地址
+  ]
+}
+```
+# Kubernetes安装
+```shell
+## 指定数据源
+## 注意：kubernetes-el7-系统架构,通过uname -m 查看机器cpu架构
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+## 查看版本
+yum list kubelet kubeadm kubectl  --showduplicates|sort -r
+## 安装指定版本
+yum install -y kubelet-1.21.10-0 kubeadm-1.21.10-0 kubectl-1.21.10-0 --disableexcludes=kubernetes 
+## 导出默认初始化配置
+kubeadm config print init-defaults > kubeadm.yaml
+
+
+## 问题
+1.failed to pull image k8s.gcr.io/kube-apiserver:v1.15.0
+docker 配置阿里云镜像加速器
+修改kubeadm镜像源地址
+vi kubeadm.yaml
+imageRepository: registry.aliyuncs.com/k8sxio
+kubernetesVersion: v1.19.3
+查看镜像源地址
+kubeadm config images list --config kubeadm.yaml
+
+2./proc/sys/net/bridge/bridge-nf-call-iptables does not exist
+vim /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+执行如下命令使其生效
+$ modprobe br_netfilter
+$ sysctl -p /etc/sysctl.d/k8s.conf
+
+
+因为k8s官网在国外，这里需要先从阿里云上下载，然后通过修改tag值的方式改为和k8s官网一样的，然后再进行安装
+在三台服务器上执行如下命令
+```bash
+images=(kube-apiserver:v1.21.10 kube-controller-manager:v1.21.10 kube-scheduler:v1.21.10 kube-proxy:v1.21.10 pause:3.4.1 etcd:3.4.13-0 coredns:v1.8.0)
+for imageName in ${images[@]} ; do
+  docker pull registry.cn-hangzhou.aliyuncs.com/google_containers/$imageName
+  docker tag registry.cn-hangzhou.aliyuncs.com/google_containers/$imageName k8s.gcr.io/$imageName
+  docker rmi registry.cn-hangzhou.aliyuncs.com/google_containers/$imageName
+done
+
+初始化集群：
+kubeadm init --kubernetes-version=v1.21.10 --pod-network-cidr=10.244.0.0/16 --service-cidr=10.96.0.0/12 --apiserver-advertise-address=172.16.5.5 --image-repository=registry.cn-hangzhou.aliyuncs.com/google_containers
+执行成功生成如下信息：
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Alternatively, if you are the root user, you can run:
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join 172.16.5.5:6443 --token 613reo.aifktgbie3qau0wj \
+        --discovery-token-ca-cert-hash sha256:5257e9ee55812feb248e6e251d9f9cd21c247959b9f8bd37513f7753d66ac85c
+
+## 安装flannel插件
+$ wget https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+# 因为有节点是多网卡，所以需要在资源清单文件中指定内网网卡
+# 搜索到名为 kube-flannel-ds 的 DaemonSet，在kube-flannel容器下面
+$ vi kube-flannel.yml
+......
+containers:
+- name: kube-flannel
+  image: quay.io/coreos/flannel:v0.13.0
+  command:
+  - /opt/bin/flanneld
+  args:
+  - --ip-masq
+  - --kube-subnet-mgr
+  - --iface=eth0  # 如果是多网卡的话，指定内网网卡的名称
+......
+$ kubectl apply -f kube-flannel.yml  # 安装 flannel 网络插件
+
+## 重置init配置
+kubeadm reset
+```
+# Kubernetes集群模式
+```shell
+1.负载均衡后端放置apiserver的3台master节点
+vip(内网地址): 172.16.5.12
+
+2.master-01节点
+$vim /etc/hosts
+172.16.5.2 master01 apiserver
+172.16.5.3 master02
+172.16.5.4 master03
+
+kubeadm init \
+--kubernetes-version 1.21.10 \
+--control-plane-endpoint "apiserver:6443" \
+--image-repository registry.cn-hangzhou.aliyuncs.com/google_containers \
+--upload-certs \
+--service-cidr=10.96.0.0/12 \
+--pod-network-cidr=192.168.0.0/16
+
+3.master-02、master-03其他主节点
+$vim /etc/hosts
+172.16.5.2 master01 
+172.16.5.3 master02
+172.16.5.4 master03
+172.16.5.12 apiserver
+
+4.修改负载均衡后端节点端口
+```
+# Kubernetes 开启ipvs
+```shell
+# 修改kube-proxy 配置
+$ kubectl edit configmap kube-proxy -n kube-system
+   minSyncPeriod: 0s
+      scheduler: ""
+      syncPeriod: 30s
+    kind: KubeProxyConfiguration
+    metricsBindAddress: 127.0.0.1:10249
+    mode: "ipvs"                          # 修改此处
+    nodePortAddresses: null
+
+# 删除所有kube-proxy的pod
+$ kubectl delete pods/kube-proxy-cz66d -n kube-system
+
+# 检查ipvs是否开启
+$ kubectl log -n 100 pods/pods/kube-proxy-cz66d -n kube-system
+I0307 08:36:08.004314       1 node.go:172] Successfully retrieved node IP: 172.16.5.12
+I0307 08:36:08.004366       1 server_others.go:140] Detected node IP 172.16.5.12
+I0307 08:36:08.020516       1 server_others.go:206] kube-proxy running in dual-stack mode, IPv4-primary
+I0307 08:36:08.020552       1 server_others.go:274] Using ipvs Proxier.
+I0307 08:36:08.020560       1 server_others.go:276] creating dualStackProxier for ipvs.
+W0307 08:36:08.020573       1 server_others.go:495] detect-local-mode set to ClusterCIDR, but no IPv6 cluster CIDR defined, , defaulting to no-op detect-local for IPv6
+
+日志出现Using ipvs Proxier即可
+# 命令行校验
+$ ipvsadm -Ln
+IP Virtual Server version 1.2.1 (size=4096)
+Prot LocalAddress:Port Scheduler Flags
+  -> RemoteAddress:Port           Forward Weight ActiveConn InActConn
+TCP  10.96.0.1:443 rr
+  -> 172.16.5.9:6443              Masq    1      0          0
+  -> 172.16.5.10:6443             Masq    1      0          0
+  -> 172.16.5.14:6443             Masq    1      0          0
+TCP  10.96.0.10:53 rr
+  -> 192.168.1.2:53               Masq    1      0          0
+  -> 192.168.4.2:53               Masq    1      0          0
+TCP  10.96.0.10:9153 rr
+  -> 192.168.1.2:9153             Masq    1      0          0
+  -> 192.168.4.2:9153             Masq    1      0          0
+
+
+# 修改ipvs scheduler
+$ kubectl edit configmap kube-proxy -n kube-system
+    ipvs:
+      excludeCIDRs: null
+      minSyncPeriod: 0s
+      scheduler: ""  # 默认为rr
+      strictARP: false
+      syncPeriod: 0s
+      tcpFinTimeout: 0s
+      tcpTimeout: 0s
+      udpTimeout: 0s
+```
+# Kubernetes 添加node节点
+```shell
+# 查看master集群token信息
+$ kubeadm token list
+# master生成token
+$ kubeadm token create --print-join-command --ttl=0
+# node节点执行join命令
+$ kubeadm join 172.16.5.5:6443 --token j904ze.n8912dqxk4p6ws8p --discovery-token-ca-cert-hash sha256:5257e9ee55812feb248e6e251d9f9cd21c247959b9f8bd37513f7753d66ac85c
+```
+# Kubernetes 安装localdns
+```shell
+前提：
+1.7版本之前的crondns有重大bug，要安装1.7之后版本
+crondns的pod数与集群比例设置为1:8
+
+# 下载localnds.yaml
+$ wget https://github.com/kubernetes/kubernetes/raw/master/cluster/addons/dns/nodelocaldns/nodelocaldns.yaml
+
+# 查看coredns serviceip
+$ kubectl get svc -n kube-system | grep kube-dns | awk '{ print $3 }'
+
+# 替换其中的变量
+__PILLAR__DNS__SERVER__ ：表示 kube-dns 这个 Service 的 ClusterIP，可以通过命令 kubectl get svc -n kube-system | grep kube-dns | awk'{ print $3 }' 获取（我们这里就是 10.96.0.10）
+__PILLAR__LOCAL__DNS__：表示 DNSCache 本地的 IP，默认为 169.254.20.10
+__PILLAR__DNS__DOMAIN__：表示集群域，默认就是 cluster.local
+
+$ sed -i 's/k8s.gcr.io\/dns/cnych/g
+s/__PILLAR__DNS__SERVER__/10.96.0.10/g
+s/__PILLAR__LOCAL__DNS__/169.254.20.10/g
+s/__PILLAR__DNS__DOMAIN__/cluster.local/g' nodelocaldns.yaml
+
+# 修改镜像地址
+$ vim nodelocaldns.yaml
+image: easzlab/k8s-dns-node-cache:1.22.13
+
+# 启动
+$ kubectl apply -f nodelocaldns.yaml
+
+# 修改每台机器上的kubelet配置
+$ sed -i 's/10.96.0.10/169.254.20.10/g' /var/lib/kubelet/config.yaml
+$ systemctl daemon-reload && systemctl restart kubelet
+```
+# k8s worker节点清除
+```shell
+# 将节点标记为不可调度
+$ kubectl cordon [node_name] 
+# 驱逐节点上的pod
+$ kubectl drain --ignore-daemonsets <节点名称>
+
+# systemd 服务
+$ systemctl stop kubelet
+$ systemctl disable kubelet
+
+# 删除kubelet、kubeadm、kubectl
+$ sudo yum remove -y kubeadm kubectl kubelet kubernetes-cni kube*   
+$ sudo yum autoremove -y
+
+配置清理
+$ rm -rf /etc/systemd/system/kubelet.service
+$ rm -rf /etc/systemd/system/kube*
+清理kubernetes配置
+$ sudo rm -rf ~/.kube
+$ sudo rm -rf /etc/kubernetes/
+$ sudo rm -rf /var/lib/kube*
+
+清除网络
+$ ifconfig cni0 down
+$ ifconfig flannel.1 down
+$ ip link del flannel.1
+$ ip link del cni0
+$ rm -rf /var/lib/cni/flannel/* && rm -rf /var/lib/cni/networks/cbr0/*
+```
+# kubectl 命令偶尔超时问题排查
+
+- **问题现象：kubectl get pods 等命令输入之后没有反应，退出重试几次才可以**
+- **排查：**
+   - 查看apiserver日志
+```shell
+$ kubectl get pods -n kube-system -o wide
+kube-apiserver-k8s-master-001            1/1     Running   0          4d20h   172.16.5.14   k8s-master-001   <none>           <none>
+kube-apiserver-k8s-master-002            1/1     Running   0          4d20h   172.16.5.10   k8s-master-002   <none>           <none>
+kube-apiserver-k8s-master-003            1/1     Running   0          4d20h   172.16.5.9    k8s-master-003   <none>           <none>
+$ kubectl logs -f pods/kube-apiserver-k8s-master-002 -n kube-system
+I0306 06:11:50.900107       1 trace.go:205] Trace[1213709531]: "Get" url:/api/v1/namespaces/kube-system/pods/kube-apiserver-k8s-master-003/log,user-agent:kubectl/v1.21.10 (linux/amd64) kubernetes/a7a3274,client:172.16.5.9,accept:application/json, */*,protocol:HTTP/2.0 (06-Mar-2023 06:10:52.027) (total time: 58872ms):
+Trace[1213709531]: ---"Transformed response object" 58870ms (06:11:00.900)
+
+日志显示：
+kubectl 命令是由 172.16.5.9 节点发起，请求到 k8s-master-003 节点，请求延时58s
+k8s-master-003节点ip172.16.5.9
+```
+
+   - 查看节点hosts文件
+```shell
+$ cat /etc/hosts
+172.16.5.14 k8s-master-001
+172.16.5.10 k8s-master-002 
+172.16.5.9  k8s-master-003
+172.16.5.11 k8s-node-004
+172.16.5.13 k8s-node-005
+172.16.5.12 k8s-node-006
+172.16.5.8 k8s-node-007
+172.16.5.16 apiserver (slb ip)
+
+解析方向
+apiserver -> 172.16.5.16 -> 分发给后端3台master节点master-001,master-002,master-003) -> api-server服务
+```
+
+- **解决办法：**
+```shell
+# 修改本机hosts文件
+apiserver -> 本机ip
+
+# 修改其他worker节点hosts
+apiserver -> slb ip
+```
+
+- **原因：**
+
+由于目前SLB负载均衡不支持同时作为客户端和服务端。
+四层监听访问源和目的都是使用IP地址作为标记的，并且SLB默认用户后端可以直接获取到用户真实客户端地址，不可修改。如果调度到自身，则回包就会直接回环。这样访问的地址目的地址会返回的源地址不一致，不是一个完整的访问，所以会超时。
